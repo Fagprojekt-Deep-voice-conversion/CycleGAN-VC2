@@ -16,7 +16,9 @@ from trainingDataset import trainingDataset
 from model_tf import Generator, Discriminator
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+import wandb
+
+# os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 
 class CycleGANTraining(object):
@@ -106,6 +108,9 @@ class CycleGANTraining(object):
             self.start_epoch = self.loadModel(restart_training_at)
             print("Training resumed")
 
+
+        self.wandb_run = wandb.init(entity = "deep_voice_inc", project = "CycleGAN", name = "Hilde_to_yangSMK", config = {"device" : self.device})
+
     def adjust_lr_rate(self, optimizer, name='generator'):
         if name == 'generator':
             self.generator_lr = max(
@@ -124,6 +129,7 @@ class CycleGANTraining(object):
 
     def train(self):
         # Training Begins
+        self.step = 0
         for epoch in range(self.start_epoch, self.num_epochs):
             start_time_epoch = time.time()
 
@@ -145,6 +151,7 @@ class CycleGANTraining(object):
             pbar = tqdm(enumerate(train_loader))
             for i, (real_A, real_B) in enumerate(train_loader):
                 num_iterations = (n_samples // self.mini_batch_size) * epoch + i
+                self.step += 1
                 # print("iteration no: ", num_iterations, epoch)
 
                 if num_iterations > 10000:
@@ -192,6 +199,7 @@ class CycleGANTraining(object):
                 generator_loss = generator_loss_A2B + generator_loss_B2A + \
                                  cycle_loss_lambda * cycleLoss + identity_loss_lambda * identiyLoss
                 self.generator_loss_store.append(generator_loss.item())
+
 
                 # Backprop for Generator
                 self.reset_grad()
@@ -242,6 +250,7 @@ class CycleGANTraining(object):
                 d_loss = (d_loss_A + d_loss_B) / 2.0 + (d_loss_A_2nd + d_loss_B_2nd) / 2.0
                 self.discriminator_loss_store.append(d_loss.item())
 
+
                 # Backprop for Discriminator
                 self.reset_grad()
                 d_loss.backward()
@@ -251,6 +260,25 @@ class CycleGANTraining(object):
                 #         self.discriminator_optimizer, name='discriminator')
 
                 self.discriminator_optimizer.step()
+
+                if (self.step+1) % 2 == 0:
+                    # wandb generator
+                    self.wandb_run.log({
+                        "Loss/Generator" : {
+                            "generator_loss" : generator_loss.item(),
+                            "generator_loss_A2B" : generator_loss_A2B,
+                            "generator_loss_B2A" : generator_loss_B2A,
+                            "cycleLoss" : cycleLoss,
+                            "identiyLoss": identiyLoss
+                            },
+                        "Loss/Dicriminator_loss" : {
+                            "d_loss_A" : d_loss_A,
+                            "d_loss_B" : d_loss_B,
+                            "d_loss" : d_loss.item(),
+                        },
+                        "epoch" : epoch
+                    
+                    }, commit = not (epoch % 500 == 0 and epoch != 0), step = self.step) # 2000
 
                 if (i + 1) % 2 == 0:
                     pbar.set_description(
@@ -278,7 +306,7 @@ class CycleGANTraining(object):
             #             print("Epoch: {} Generator Loss: {:.4f} Discriminator Loss: {}, Time: {:.2f}\n\n".format(
             #                 epoch, generator_loss.item(), d_loss.item(), end_time - start_time_epoch))
 
-            if epoch % 2000 == 0 and epoch != 0:
+            if epoch % 500 == 0 and epoch != 0:
                 end_time = time.time()
                 store_to_file = "Epoch: {} Generator Loss: {:.4f} Discriminator Loss: {}, Time: {:.2f}\n\n".format(
                     epoch, generator_loss.item(), d_loss.item(), end_time - start_time_epoch)
@@ -294,11 +322,11 @@ class CycleGANTraining(object):
                     self.modelCheckpoint + '_CycleGAN_CheckPoint'))
                 print("Model Saved!")
 
-            if epoch % 2000 == 0 and epoch != 0:
+            if epoch % 500 == 0 and epoch != 0:
                 # Validation Set
                 validation_start_time = time.time()
                 self.validation_for_A_dir()
-                self.validation_for_B_dir()
+                # self.validation_for_B_dir()
                 validation_end_time = time.time()
                 store_to_file = "Time taken for validation Set: {}".format(
                     validation_end_time - validation_start_time)
@@ -358,6 +386,10 @@ class CycleGANTraining(object):
             librosa.output.write_wav(path=os.path.join(output_A_dir, os.path.basename(file)),
                                      y=wav_transformed,
                                      sr=sampling_rate)
+            try:
+                self.wandb_run.log({os.path.basename(file).replace(".wav", "") : wandb.Audio(wav_transformed, caption = os.path.basename(file), sample_rate = sampling_rate)}, step = self.step, commit = False)
+            except:
+                self.wandb_run.log({os.path.basename(file).replace(".wav", "") : wandb.Audio(wav_transformed, caption = os.path.basename(file), sample_rate = sampling_rate)})
 
     def validation_for_B_dir(self):
         num_mcep = 36
@@ -412,6 +444,8 @@ class CycleGANTraining(object):
                                      y=wav_transformed,
                                      sr=sampling_rate)
 
+            self.wandb_run.log({os.path.basename(file).replace(".wav", "") : wandb.Audio(wav_transformed, caption = os.path.basename(file), sample_rate = sampling_rate)}, commit = True, step = self.step)
+
     def savePickle(self, variable, fileName):
         with open(fileName, 'wb') as f:
             pickle.dump(variable, f)
@@ -438,8 +472,12 @@ class CycleGANTraining(object):
             'discriminator_optimizer': self.discriminator_optimizer.state_dict()
         }, PATH)
 
+        artifact = wandb.Artifact("model_" + str(np.random.randint(1e6)), "CycleGAN")
+        artifact.add_file(PATH)
+        self.wandb_run.log_artifact(artifact)
+
     def loadModel(self, PATH):
-        checkPoint = torch.load(PATH)
+        checkPoint = torch.load(PATH, map_location=self.device)
         self.generator_A2B.load_state_dict(
             state_dict=checkPoint['model_genA2B_state_dict'])
         self.generator_B2A.load_state_dict(
@@ -527,4 +565,6 @@ if __name__ == '__main__':
                                 validation_B_dir=validation_B_dir,
                                 output_B_dir=output_B_dir,
                                 restart_training_at=resume_training_at)
+    print("Training starting on ", cycleGAN.device)
     cycleGAN.train()
+    # cycleGAN.validation_for_A_dir()
